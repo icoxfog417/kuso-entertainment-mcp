@@ -1,0 +1,376 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Kuso MCP Server with Entertainment Gateway - Infrastructure Stack
+
+Parameters:
+  StackName:
+    Type: String
+    Default: kuso-mcp-gateway
+  GoogleClientId:
+    Type: String
+    NoEcho: true
+  GoogleClientSecret:
+    Type: String
+    NoEcho: true
+
+Resources:
+  # =============================================================================
+  # KMS Key for Token Encryption
+  # =============================================================================
+
+  # KMS key for encrypting OAuth tokens at rest
+  TokenEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub '${StackName} OAuth token encryption key'
+      KeyPolicy:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  TokenEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${StackName}-kuso-tokens'
+      TargetKeyId: !Ref TokenEncryptionKey
+
+  # =============================================================================
+  # Outbound OAuth Callback Infrastructure (CloudFront -> Lambda -> DynamoDB)
+  # Replaces local server for production-ready session binding
+  # =============================================================================
+
+  # DynamoDB table for OAuth session storage
+  OAuthSessionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${StackName}-kuso-sessions'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Lambda execution role
+  CallbackLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackName}-callback-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: dynamodb-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt OAuthSessionTable.Arn
+        - PolicyName: agentcore-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:CompleteResourceTokenAuth
+                Resource: '*'
+        - PolicyName: kms-decrypt
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt TokenEncryptionKey.Arn
+        - PolicyName: secrets-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: '*'
+
+  # Lambda function for OAuth callback - completes session binding
+  CallbackLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${StackName}-kuso-callback'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt CallbackLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OAuthSessionTable
+          KMS_KEY_ID: !Ref TokenEncryptionKey
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import base64
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TABLE_NAME'])
+          agentcore = boto3.client('bedrock-agentcore')
+          kms = boto3.client('kms')
+
+          INBOUND_HTML = '<h1>Sign-in Complete!</h1><p>You can close this window and return to the terminal.</p>'
+          OUTBOUND_HTML = '<h1>YouTube Authorized!</h1><p>You can close this window and return to the terminal.</p>'
+
+          def handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+              path = event.get('rawPath', '/')
+              qs = event.get('queryStringParameters') or {}
+              session_id = qs.get('session_id')
+
+              # Inbound auth: use user_id from query param to complete auth
+              if path == '/inbound':
+                  user_id = qs.get('user_id')
+                  if not session_id or not user_id:
+                      return {'statusCode': 400, 'headers': {'Content-Type': 'text/html'},
+                              'body': '<h1>Error</h1><p>Missing session_id or user_id</p>'}
+                  try:
+                      agentcore.complete_resource_token_auth(
+                          sessionUri=session_id,
+                          userIdentifier={'userId': user_id}
+                      )
+                  except Exception as e:
+                      return {'statusCode': 500, 'headers': {'Content-Type': 'text/html'},
+                              'body': f'<h1>Error</h1><p>{str(e)}</p>'}
+                  return {'statusCode': 200, 'headers': {'Content-Type': 'text/html'},
+                          'body': INBOUND_HTML}
+
+              # Outbound auth: require session_id and stored token
+              if not session_id:
+                  return {'statusCode': 400, 'headers': {'Content-Type': 'text/html'},
+                          'body': '<h1>Error</h1><p>Missing session_id</p>'}
+
+              # Get encrypted token from DynamoDB
+              resp = table.get_item(Key={'session_id': session_id})
+              if 'Item' not in resp:
+                  return {'statusCode': 400, 'headers': {'Content-Type': 'text/html'},
+                          'body': '<h1>Error</h1><p>Unknown session</p>'}
+
+              encrypted_token = resp['Item'].get('encrypted_user_token')
+              if not encrypted_token:
+                  return {'statusCode': 400, 'headers': {'Content-Type': 'text/html'},
+                          'body': '<h1>Error</h1><p>Missing encrypted token</p>'}
+
+              # Decrypt token with KMS
+              try:
+                  # Convert base64 string back to binary for decryption
+                  ciphertext = base64.b64decode(encrypted_token)
+                  decrypt_response = kms.decrypt(CiphertextBlob=ciphertext)
+                  user_token = decrypt_response['Plaintext'].decode()
+              except Exception as e:
+                  return {'statusCode': 500, 'headers': {'Content-Type': 'text/html'},
+                          'body': '<h1>Error</h1><p>Token decryption failed</p>'}
+
+              # Complete OAuth with decrypted token
+              try:
+                  agentcore.complete_resource_token_auth(
+                      sessionUri=session_id,
+                      userIdentifier={'userToken': user_token}
+                  )
+              except Exception as e:
+                  table.update_item(
+                      Key={'session_id': session_id},
+                      UpdateExpression='SET #s = :s, #e = :e',
+                      ExpressionAttributeNames={'#s': 'status', '#e': 'error'},
+                      ExpressionAttributeValues={':s': 'FAILED', ':e': str(e)}
+                  )
+                  return {'statusCode': 500, 'headers': {'Content-Type': 'text/html'},
+                          'body': f'<h1>Error</h1><p>{str(e)}</p>'}
+
+              # Mark complete and remove encrypted token (cleanup)
+              table.update_item(
+                  Key={'session_id': session_id},
+                  UpdateExpression='SET #s = :s REMOVE encrypted_user_token',
+                  ExpressionAttributeNames={'#s': 'status'},
+                  ExpressionAttributeValues={':s': 'COMPLETE'}
+              )
+
+              return {'statusCode': 200, 'headers': {'Content-Type': 'text/html'},
+                      'body': OUTBOUND_HTML}
+
+  # Lambda Function URL (origin for CloudFront)
+  CallbackLambdaUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: AWS_IAM
+      TargetFunctionArn: !Ref CallbackLambda
+
+  # OAC for Lambda - restricts access to CloudFront only
+  LambdaOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${StackName}-lambda-oac'
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # Permission for CloudFront to invoke Lambda via OAC
+  CallbackLambdaCloudFrontPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CallbackLambda
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CallbackDistribution}'
+      FunctionUrlAuthType: AWS_IAM
+
+  # CloudFront Distribution -> Lambda Function URL (via OAC)
+  # Provides WAF capability, DDoS protection, and restricts Lambda access
+  CallbackDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${StackName} Kuso callback'
+        Origins:
+          - Id: LambdaOrigin
+            DomainName: !Select [2, !Split ['/', !GetAtt CallbackLambdaUrl.FunctionUrl]]
+            OriginAccessControlId: !Ref LambdaOAC
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+        DefaultCacheBehavior:
+          TargetOriginId: LambdaOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          # Managed policies: CachingDisabled + AllViewerExceptHostHeader
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
+  # =============================================================================
+  # Inbound Authentication Infrastructure (Cognito with Google Federation)
+  # =============================================================================
+
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${StackName}-pool'
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+
+  # Cognito User Pool Domain
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub '${StackName}-${AWS::AccountId}'
+      UserPoolId: !Ref UserPool
+
+  # Cognito Google Identity Provider
+  GoogleIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Properties:
+      UserPoolId: !Ref UserPool
+      ProviderName: Google
+      ProviderType: Google
+      ProviderDetails:
+        client_id: !Ref GoogleClientId
+        client_secret: !Ref GoogleClientSecret
+        authorize_scopes: 'openid email profile'
+      AttributeMapping:
+        email: email
+        username: sub
+
+  # Cognito App Client
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: GoogleIdentityProvider
+    Properties:
+      ClientName: !Sub '${StackName}-client'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      SupportedIdentityProviders: [Google, COGNITO]
+      CallbackURLs:
+        - !Sub 'https://bedrock-agentcore.${AWS::Region}.amazonaws.com/identities/oauth2/callback'
+      LogoutURLs:
+        - !Sub 'https://${CallbackDistribution.DomainName}/'
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      AllowedOAuthFlowsUserPoolClient: true
+
+  # =============================================================================
+  # Gateway Execution Role
+  # =============================================================================
+
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackName}-gateway-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: workload-identity
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                  - bedrock-agentcore:GetResourceOAuth2Token
+                Resource: '*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: '*'
+
+Outputs:
+  # Outbound OAuth Callback
+  OAuthCallbackUrl:
+    Value: !Sub 'https://${CallbackDistribution.DomainName}/'
+    Description: CloudFront URL for OAuth callback (register in Google OAuth app)
+  OAuthSessionTableName:
+    Value: !Ref OAuthSessionTable
+    Description: DynamoDB table for OAuth session storage
+  DistributionId:
+    Value: !Ref CallbackDistribution
+
+  # Inbound Authentication (Cognito)
+  InboundUserPoolId:
+    Value: !Ref UserPool
+  InboundClientId:
+    Value: !Ref UserPoolClient
+  InboundDiscoveryUrl:
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration'
+  InboundCognitoDomain:
+    Value: !Sub '${StackName}-${AWS::AccountId}'
+
+  # KMS Key for Token Encryption
+  KMSKeyId:
+    Value: !Ref TokenEncryptionKey
+    Description: KMS key ID for token encryption (add to config.json)
+  KMSKeyAlias:
+    Value: !Ref TokenEncryptionKeyAlias
+    Description: KMS key alias for token encryption
+
+  # Gateway
+  GatewayRoleArn:
+    Value: !GetAtt GatewayRole.Arn

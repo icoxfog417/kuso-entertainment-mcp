@@ -8,11 +8,12 @@ dependencies = [
     "bedrock-agentcore>=1.1.1",
     "bedrock-agentcore-starter-toolkit>=0.2.5",
     "boto3>=1.42.9",
+    "fastmcp>=2.14.0",
+    "python-dotenv>=1.2.1",
+    "requests>=2.32.5",
     "strands-agents>=1.19.0",
     "strands-agents-evals>=0.1.0",
     "strands-agents-tools>=0.2.17",
-    "yt-dlp>=2024.12.6",
-    "youtube-transcript-api>=1.0.3",
 ]
 
 [dependency-groups]

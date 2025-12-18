@@ -1,0 +1,11 @@
+Iteration 1: Initial Kuso Agent Setup
+- Observation: Copied oauth-gateway-from-agent reference to kuso_agent
+- Orient: Need to modify for development-focused YouTube watching during wait times
+- Decide: Update OpenAPI spec to use get_recommendations with proper tool descriptions
+- Action: 
+  * Updated construct.py OpenAPI spec with get_recommendations operation
+  * Modified tool description to match simulator.py specifications
+  * Updated main.py for development-focused agent
+  * Changed system prompt to focus on coding assistance
+  * Renamed oauth_gateway_from_agent directory to kuso_infra
+  * Renamed oauth_gateway_infra.yaml to kuso_infra.yaml

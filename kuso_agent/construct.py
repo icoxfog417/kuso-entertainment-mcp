@@ -80,6 +80,15 @@ def main():
     config.update(target_config)
     print(f"    ✓ Target ID: {target_config['target_id']}")
 
+    # 2e: Start Viewing Lambda Target
+    print("  2e: Creating Start Viewing Lambda Target...")
+    start_viewing_config = create_start_viewing_target(
+        gateway_config["gateway_id"],
+        cfn_outputs["StartViewingLambdaArn"]
+    )
+    config.update(start_viewing_config)
+    print(f"    ✓ Target ID: {start_viewing_config['start_viewing_target_id']}")
+
     # Add callback URLs and KMS key to config
     cognito_domain = cfn_outputs.get("InboundCognitoDomain", "")
     config["inbound_callback_url"] = f"https://{cognito_domain}.auth.{REGION}.amazoncognito.com/oauth2/idpresponse"
@@ -352,12 +361,14 @@ def create_gateway_target(gateway_id: str, provider_arn: str, callback_url: str)
             "/search": {
                 "get": {
                     "operationId": "get_recommendations",
-                    "description": "Get personalized content recommendations for idle time utilization. This tool is designed for situations when you need to wait - such as during build processes, deployment operations, test execution, or when the user explicitly says 'wait', 'hold on', or indicates they'll be away for minutes. After getting recommendations, follow these steps: 1. Call start_viewing with a selected content 2. Call end_viewing with the started_at from step 1 3. Share your impression with the user",
+                    "description": "Get personalized content recommendations for idle time utilization. This tool is designed for situations when you need to wait - such as during build processes, deployment operations, test execution, or when the user explicitly says 'wait', 'hold on', or indicates they'll be away for minutes. After getting recommendations, call start_viewing with a selected video_id, then share your impression with the user.",
                     "parameters": [
-                        {"name": "part", "in": "query", "required": True, "schema": {"type": "string", "default": "snippet"}},
-                        {"name": "q", "in": "query", "required": True, "schema": {"type": "string"}, "description": "Search query for content recommendations"},
-                        {"name": "maxResults", "in": "query", "schema": {"type": "integer", "default": 6}, "description": "Number of recommendations to return (default: 6)"},
-                        {"name": "order", "in": "query", "schema": {"type": "string", "default": "relevance"}},
+                        {"name": "part", "in": "query", "required": True, "schema": {"type": "string", "default": "snippet"}, "description": "Comma-separated list of one or more search resource properties. 'snippet' is commonly used."},
+                        {"name": "q", "in": "query", "required": True, "schema": {"type": "string"}, "description": "Search query term. Optional; at least one of q, channelId, or relatedToVideoId may be used depending on the request."},
+                        {"name": "type", "in": "query", "required": False, "schema": {"type": "string", "default": "video", "enum": ["video", "channel", "playlist"]}, "description": "Restrict results to a particular resource type."},
+                        {"name": "maxResults", "in": "query", "required": False, "schema": {"type": "integer", "default": 5, "minimum": 0, "maximum": 7}, "description": "Maximum number of items to return. Valid values: 0..50. Default: 5."},
+                        {"name": "order", "in": "query", "required": False, "schema": {"type": "string", "default": "relevance", "enum": ["date", "rating", "relevance", "title", "videoCount", "viewCount"]}, "description": "Sort order of results."},
+                        {"name": "pageToken", "in": "query", "required": False, "schema": {"type": "string"}, "description": "Token for the page of results to retrieve."},
                     ],
                     "responses": {"200": {"description": "Returns personalized content recommendations"}},
                 }
@@ -393,6 +404,44 @@ def create_gateway_target(gateway_id: str, provider_arn: str, callback_url: str)
     return {"target_id": target_id, "target_name": target_name}
 
 
+def create_start_viewing_target(gateway_id: str, lambda_arn: str) -> dict:
+    """Create Gateway Target for Start Viewing Lambda."""
+    client = boto3.client("bedrock-agentcore-control", region_name=REGION)
+    target_name = f"{STACK_NAME}-start-viewing-target"
+
+    tool_schema = [
+        {
+            "name": "start_viewing",
+            "description": "Start watching a YouTube video. Call this after get_recommendations to begin viewing selected content. Returns session info and screenshot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "video_id": {"type": "string", "description": "YouTube video ID to watch"},
+                    "duration": {"type": "integer", "description": "Viewing duration in seconds (default: 300)"}
+                },
+                "required": ["video_id"]
+            }
+        }
+    ]
+
+    try:
+        response = client.create_gateway_target(
+            gatewayIdentifier=gateway_id,
+            name=target_name,
+            targetConfiguration={"mcp": {"lambda": {"lambdaArn": lambda_arn, "toolSchema": {"inlinePayload": tool_schema}}}},
+            credentialProviderConfigurations=[{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
+        )
+        target_id = response["targetId"]
+    except client.exceptions.ConflictException:
+        targets = client.list_gateway_targets(gatewayIdentifier=gateway_id, maxResults=100)
+        for t in targets.get("items", []):
+            if t.get("name") == target_name:
+                return {"start_viewing_target_id": t["targetId"], "start_viewing_target_name": target_name}
+        raise Exception(f"Target {target_name} not found")
+
+    return {"start_viewing_target_id": target_id, "start_viewing_target_name": target_name}
+
+
 def cleanup():
     """Delete all resources."""
     print(f"Region: {REGION}")
@@ -410,6 +459,11 @@ def cleanup():
         try:
             control_client.delete_gateway_target(gatewayIdentifier=gateway_id, targetId=config.get("target_id", ""))
             print("  ✓ Deleted Gateway Target")
+        except Exception as e:
+            print(f"  ⚠ {e}")
+        try:
+            control_client.delete_gateway_target(gatewayIdentifier=gateway_id, targetId=config.get("start_viewing_target_id", ""))
+            print("  ✓ Deleted Start Viewing Target")
         except Exception as e:
             print(f"  ⚠ {e}")
         try:

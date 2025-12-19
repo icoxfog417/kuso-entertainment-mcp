@@ -341,6 +341,78 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: '*'
+        - PolicyName: lambda-invoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt StartViewingLambda.Arn
+
+  # =============================================================================
+  # Start Viewing Lambda (AgentCore Gateway Target)
+  # =============================================================================
+
+  # Lambda Layer for boto3, playwright and bedrock-agentcore dependencies
+  BrowserDepsLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${StackName}-browser-deps'
+      Description: boto3, playwright and bedrock-agentcore for AgentCore Browser
+      CompatibleRuntimes:
+        - python3.12
+      Content:
+        S3Bucket: !Sub '${StackName}-lambda-code'
+        S3Key: layers/browser-deps.zip
+
+  StartViewingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackName}-start-viewing-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: agentcore-browser
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:StartBrowserSession
+                  - bedrock-agentcore:StopBrowserSession
+                  - bedrock-agentcore:GetBrowserSession
+                  - bedrock-agentcore:ListBrowserSessions
+                  - bedrock-agentcore:UpdateBrowserStream
+                  - bedrock-agentcore:ConnectBrowserAutomationStream
+                Resource:
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:aws:browser/*'
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:aws:browser-session/*'
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:browser/*'
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:browser-session/*'
+
+  StartViewingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${StackName}-start-viewing'
+      Runtime: python3.12
+      Handler: start_viewing.handler
+      Role: !GetAtt StartViewingLambdaRole.Arn
+      Timeout: 600
+      MemorySize: 512
+      Architectures:
+        - arm64
+      Layers:
+        - !Ref BrowserDepsLayer
+      Code:
+        S3Bucket: !Sub '${StackName}-lambda-code'
+        S3Key: lambdas/start_viewing.zip
 
 Outputs:
   # Outbound OAuth Callback
@@ -374,3 +446,8 @@ Outputs:
   # Gateway
   GatewayRoleArn:
     Value: !GetAtt GatewayRole.Arn
+
+  # Start Viewing Lambda
+  StartViewingLambdaArn:
+    Value: !GetAtt StartViewingLambda.Arn
+    Description: Lambda ARN for start_viewing Gateway target

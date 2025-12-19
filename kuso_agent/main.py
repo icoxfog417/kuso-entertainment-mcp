@@ -5,6 +5,7 @@ An agent that watches YouTube videos during development waiting periods (builds,
 Uses OAuth Gateway for secure YouTube API access.
 """
 
+import argparse
 import base64
 import json
 import time
@@ -17,6 +18,8 @@ from bedrock_agentcore.identity import requires_access_token
 from mcp.client.streamable_http import streamablehttp_client
 from strands import Agent
 from strands.tools.mcp import MCPClient
+
+DEFAULT_PROMPT = "I'm starting a deployment now. Please wait, it will take about 5 minutes."
 
 
 def load_config() -> dict:
@@ -150,11 +153,11 @@ def handle_oauth_flow(endpoint: str, token: str) -> bool:
         return False
 
 
-def watch_during_development():
+def watch_during_development(user_prompt: str = DEFAULT_PROMPT):
     """Main function for development interval entertainment."""
     print("🎭 Kuso Entertainment Agent - Development Edition")
     print("   Perfect for entertainment during builds, deploys, and tests!")
-    run_kuso_agent()
+    run_kuso_agent(user_prompt=user_prompt)
 
 
 @requires_access_token(
@@ -164,7 +167,7 @@ def watch_during_development():
     callback_url=get_inbound_callback_url(),
     on_auth_url=lambda url: (print(f"\nOpen this URL to sign in:\n  {url}\n"), webbrowser.open(url)),
 )
-def run_kuso_agent(*, access_token: str):
+def run_kuso_agent(*, access_token: str, user_prompt: str = DEFAULT_PROMPT):
     """Run Kuso Entertainment Agent for development intervals."""
     print(f"✓ Kuso Agent authenticated (token length: {len(access_token)})")
 
@@ -189,11 +192,15 @@ def run_kuso_agent(*, access_token: str):
             tools=tools
         )
         
-        response = agent("I'm starting a deployment now. Please wait, it will take about 5 minutes.")
+        response = agent(user_prompt)
         print(f"\n🎬 Development Assistant Response:\n{response}")
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Kuso Entertainment Agent")
+    parser.add_argument("--prompt", "-p", default=DEFAULT_PROMPT, help="Prompt for the agent")
+    args = parser.parse_args()
+
     if not INBOUND_PROVIDER_NAME or not GATEWAY_ENDPOINT:
         print("Error: Missing config. Run 'uv run python construct.py' first.")
         exit(1)
@@ -210,4 +217,4 @@ if __name__ == "__main__":
 
     print("Starting Kuso Entertainment Agent...")
     print(f"  Gateway: {GATEWAY_ENDPOINT}")
-    watch_during_development()
+    watch_during_development(user_prompt=args.prompt)

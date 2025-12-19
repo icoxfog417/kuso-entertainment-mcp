@@ -154,10 +154,7 @@ async def watch_youtube_with_live_view(playwright: Playwright, url: str):
         await page.screenshot(path="tests/youtube_after_intervention.png")
         final_title = await page.title()
         print(f"After intervention - Title: {final_title}")
-        
-        # Watch video for a bit
-        print("Watching video for 10 seconds...")
-        await asyncio.sleep(10)
+        print("Reconnection successful - test complete!")
         
         return {"title": final_title, "url": page.url}
     finally:
@@ -165,7 +162,11 @@ async def watch_youtube_with_live_view(playwright: Playwright, url: str):
             await browser.close()
         except Exception:
             pass
-        client.stop()
+        try:
+            client.stop()
+        except Exception as e:
+            print(f"Session cleanup warning: {e}")
+            pass
 
 
 @pytest.mark.asyncio

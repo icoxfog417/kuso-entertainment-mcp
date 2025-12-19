@@ -14,44 +14,7 @@ AgentCore Gateway serves as the MCP server, handling:
 
 ## Architecture
 
-```mermaid
-flowchart TB
-    subgraph AWS["AWS Resources"]
-        subgraph Cognito["Cognito User Pool"]
-            CUP["User Pool<br/>Google Federation"]
-        end
-
-        subgraph Identity["AgentCore Identity"]
-            IP["Inbound Provider<br/>Cognito"]
-            OP["Outbound Provider<br/>Google (YouTube API)"]
-        end
-
-        subgraph Gateway["AgentCore Gateway (MCP)"]
-            GW["Gateway<br/>CUSTOM_JWT Authorizer"]
-            TGT["Target<br/>YouTube API"]
-        end
-
-        subgraph Infra["Callback Infrastructure"]
-            CF["CloudFront Distribution"]
-            LF["Lambda Function"]
-            DB["DynamoDB<br/>Session Storage"]
-        end
-    end
-
-    subgraph External["External Services"]
-        G["Google OAuth"]
-        YT["YouTube Data API v3"]
-    end
-
-    IP --> CUP
-    CUP --> G
-    OP --> G
-    TGT --> YT
-    CF --> LF
-    LF --> DB
-    CF -.-> G
-    GW --> TGT
-```
+![kuso_agent](./kuso_agent/architecture.png)
 
 ### Why We need Cognito ?
 
